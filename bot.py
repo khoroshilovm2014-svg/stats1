@@ -39,37 +39,47 @@ class BlitzBotUltimate:
         """Инициализация базы данных SQLite"""
         db_file = 'bot_data.db'
         
-        # Если база повреждена - удаляем и создаем новую
+        # Если база существует, проверяем не повреждена ли она
         if os.path.exists(db_file):
             try:
-                test_conn = sqlite3.connect(db_file)
-                test_cursor = test_conn.cursor()
-                test_cursor.execute('SELECT 1')
-                test_cursor.close()
-                test_conn.close()
+                # Пробуем подключиться
+                temp_conn = sqlite3.connect(db_file)
+                temp_cursor = temp_conn.cursor()
+                temp_cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                temp_cursor.close()
+                temp_conn.close()
             except sqlite3.Error:
+                # Если повреждена, удаляем и создаем новую
                 try:
                     os.remove(db_file)
                 except:
                     pass
         
-        # Создаем новое соединение с базой данных
+        # Создаем новое соединение
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
         
-        # Таблица пользователей
+        # Создаем таблицы если их нет
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         self.conn.commit()
+        print("✅ База данных инициализирована")
     
     def signal_handler(self, signum, frame):
         print("\n🛑 Получен сигнал остановки...")
@@ -340,6 +350,21 @@ class BlitzBotUltimate:
             ]
         }
     
+    def create_admin_keyboard(self):
+        """Создание админ-клавиатуры"""
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 Статистика бота", "callback_data": "admin_stats"},
+                    {"text": "👥 Список пользователей", "callback_data": "admin_users"}
+                ],
+                [
+                    {"text": "🚫 Заблокированные", "callback_data": "admin_blocks"},
+                    {"text": "📢 Рассылка", "callback_data": "admin_broadcast"}
+                ]
+            ]
+        }
+    
     def generate_stats_file(self, nickname, stats, tanks, tank_info):
         """Генерация файла со статистикой"""
         created = datetime.fromtimestamp(stats['created_at']).strftime('%d.%m.%Y %H:%M')
@@ -475,7 +500,7 @@ class BlitzBotUltimate:
         user_id = message['from']['id']
         text = message.get('text', '').strip()
         
-        # Добавляем пользователя в базу
+        # СОХРАНЯЕМ ПОЛЬЗОВАТЕЛЯ В БАЗЕ
         try:
             username = message['from'].get('username')
             first_name = message['from'].get('first_name')
@@ -489,19 +514,93 @@ class BlitzBotUltimate:
         except:
             pass
         
-        if text == '/start':
-            welcome = (
-                "🎮 *WoT BLITZ STATS BOT*\n\n"
-                "Привет, танкист! 👋\n\n"
-                "Я покажу тебе статистику и ангар любого игрока WoT Blitz.\n\n"
-                "*Как пользоваться:*\n"
-                "Просто отправь мне никнейм игрока\n\n"
-                "*Пример:* `PRO_100_IGROK`\n\n"
-                "Поддержи канал: @freeaccountanksblitz"
-            )
-            self.send_message(chat_id, welcome)
+        # ПРОВЕРЯЕМ КОМАНДЫ В САМОМ НАЧАЛЕ
+        if text.startswith('/'):
+            # Команда /start
+            if text == '/start':
+                welcome = (
+                    "🎮 *WoT BLITZ STATS BOT*\n\n"
+                    "Привет, танкист! 👋\n\n"
+                    "Я покажу тебе статистику и ангар любого игрока WoT Blitz.\n\n"
+                    "*Как пользоваться:*\n"
+                    "Просто отправь мне никнейм игрока\n\n"
+                    "*Пример:* `PRO_100_IGROK`\n\n"
+                    "Поддержи канал: @freeaccountanksblitz"
+                )
+                self.send_message(chat_id, welcome)
+                return
+            
+            # Админ команды (только для админов)
+            if user_id in ADMIN_IDS:
+                if text == '/admin':
+                    keyboard = self.create_admin_keyboard()
+                    self.send_message(chat_id, "👑 *ПАНЕЛЬ АДМИНИСТРАТОРА*", keyboard)
+                    return
+                
+                elif text.startswith('/block '):
+                    try:
+                        block_user_id = int(text.split()[1])
+                        reason = ' '.join(text.split()[2:]) if len(text.split()) > 2 else "Нарушение правил"
+                        self.cursor.execute('''
+                            INSERT OR REPLACE INTO blocked_users (user_id, reason) 
+                            VALUES (?, ?)
+                        ''', (block_user_id, reason))
+                        self.conn.commit()
+                        self.send_message(chat_id, f"✅ Пользователь {block_user_id} заблокирован.\nПричина: {reason}")
+                    except:
+                        self.send_message(chat_id, "❌ Использование: /block <user_id> [причина]")
+                    return
+                
+                elif text.startswith('/unblock '):
+                    try:
+                        unblock_user_id = int(text.split()[1])
+                        self.cursor.execute('DELETE FROM blocked_users WHERE user_id = ?', (unblock_user_id,))
+                        self.conn.commit()
+                        self.send_message(chat_id, f"✅ Пользователь {unblock_user_id} разблокирован")
+                    except:
+                        self.send_message(chat_id, "❌ Использование: /unblock <user_id>")
+                    return
+                
+                elif text == '/stats':
+                    self.cursor.execute('SELECT COUNT(*) FROM users')
+                    total_users = self.cursor.fetchone()[0]
+                    
+                    self.cursor.execute('SELECT COUNT(*) FROM blocked_users')
+                    blocked_users = self.cursor.fetchone()[0]
+                    
+                    stats_msg = f"📊 *СТАТИСТИКА БОТА:*\n\n"
+                    stats_msg += f"👤 Всего пользователей: `{total_users}`\n"
+                    stats_msg += f"🚫 Заблокировано: `{blocked_users}`\n"
+                    stats_msg += f"🔄 Смещение updates: `{self.offset}`\n"
+                    
+                    self.send_message(chat_id, stats_msg)
+                    return
+            
+            # Если команда не распознана, покажем помощь
+            help_text = "📋 *Доступные команды:*\n\n"
+            help_text += "`/start` - Начать работу с ботом\n"
+            help_text += "`никнейм` - Найти статистику игрока\n\n"
+            
+            if user_id in ADMIN_IDS:
+                help_text += "*Админ команды:*\n"
+                help_text += "`/admin` - Панель администратора\n"
+                help_text += "`/block <id> [причина]` - Заблокировать\n"
+                help_text += "`/unblock <id>` - Разблокировать\n"
+                help_text += "`/stats` - Статистика бота\n"
+            
+            self.send_message(chat_id, help_text)
             return
         
+        # ПРОВЕРЯЕМ БЛОКИРОВКУ
+        try:
+            self.cursor.execute('SELECT user_id FROM blocked_users WHERE user_id = ?', (user_id,))
+            if self.cursor.fetchone():
+                self.send_message(chat_id, "❌ Вы заблокированы в этом боте.")
+                return
+        except:
+            pass
+        
+        # ЕСЛИ НЕ КОМАНДА - ИЩЕМ ИГРОКА
         if not text or len(text) < 3:
             self.send_message(chat_id, "❌ Никнейм должен содержать минимум 3 символа")
             return
@@ -557,6 +656,97 @@ class BlitzBotUltimate:
         except:
             pass
         
+        # Админ функции
+        if user_id in ADMIN_IDS:
+            if data == 'admin_stats':
+                self.cursor.execute('SELECT COUNT(*) FROM users')
+                total_users = self.cursor.fetchone()[0]
+                
+                self.cursor.execute('SELECT COUNT(*) FROM blocked_users')
+                blocked_users = self.cursor.fetchone()[0]
+                
+                stats_msg = f"📊 *СТАТИСТИКА БОТА:*\n\n"
+                stats_msg += f"👤 Всего пользователей: `{total_users}`\n"
+                stats_msg += f"🚫 Заблокировано: `{blocked_users}`\n"
+                stats_msg += f"🔄 Смещение updates: `{self.offset}`\n"
+                stats_msg += f"📝 Данных в памяти: `{len(self.user_data)}`\n"
+                
+                self.send_message(chat_id, stats_msg)
+                return
+                
+            elif data == 'admin_users':
+                self.cursor.execute('''
+                    SELECT user_id, username, first_name, joined_at 
+                    FROM users 
+                    ORDER BY joined_at DESC 
+                    LIMIT 15
+                ''')
+                users = self.cursor.fetchall()
+                
+                message = f"👥 *ПОСЛЕДНИЕ 15 ПОЛЬЗОВАТЕЛЕЙ:*\n\n"
+                
+                for user in users:
+                    user_id, username, first_name, joined_at = user
+                    message += f"• ID: `{user_id}`"
+                    if username:
+                        message += f" (@{username})"
+                    elif first_name:
+                        message += f" ({first_name})"
+                    message += f"\n  📅 Присоединился: {joined_at}\n\n"
+                
+                self.send_message(chat_id, message)
+                return
+                
+            elif data == 'admin_blocks':
+                self.cursor.execute('SELECT user_id, reason, blocked_at FROM blocked_users ORDER BY blocked_at DESC')
+                blocked = self.cursor.fetchall()
+                
+                if not blocked:
+                    self.send_message(chat_id, "🚫 *ЗАБЛОКИРОВАННЫЕ ПОЛЬЗОВАТЕЛИ:*\n\nНет заблокированных пользователей")
+                    return
+                
+                message = "🚫 *ЗАБЛОКИРОВАННЫЕ ПОЛЬЗОВАТЕЛИ:*\n\n"
+                for block in blocked:
+                    user_id, reason, blocked_at = block
+                    message += f"• ID: `{user_id}`\n"
+                    message += f"  Причина: {reason}\n"
+                    message += f"  Дата: {blocked_at}\n\n"
+                
+                self.send_message(chat_id, message)
+                return
+                
+            elif data == 'admin_broadcast':
+                self.user_data[f"{chat_id}_broadcast"] = True
+                self.send_message(chat_id, 
+                    "📨 *РАССЫЛКА СООБЩЕНИЙ:*\n\n"
+                    "Отправьте сообщение для рассылки всем пользователям бота."
+                )
+                return
+        
+        # Обработка рассылки
+        if self.user_data.get(f"{chat_id}_broadcast"):
+            del self.user_data[f"{chat_id}_broadcast"]
+            
+            # Получаем всех пользователей
+            self.cursor.execute('SELECT user_id FROM users')
+            users = self.cursor.fetchall()
+            
+            success = 0
+            failed = 0
+            
+            for user in users:
+                user_id = user[0]
+                try:
+                    self.send_message(user_id, data)
+                    success += 1
+                    time.sleep(0.1)
+                except:
+                    failed += 1
+            
+            self.send_message(chat_id, f"📨 *РЕЗУЛЬТАТ РАССЫЛКИ:*\n\n✅ Отправлено: {success}\n❌ Не отправлено: {failed}")
+            return
+        
+        # Основные функции
         user_data = self.user_data.get(f"{chat_id}_data")
         if not user_data:
             self.send_message(chat_id, "❌ Данные не найдены. Отправьте никнейм снова.")
@@ -613,6 +803,7 @@ class BlitzBotUltimate:
         print("🏆 Топ танков по боям")
         print("📁 Скачивание статистики в файл")
         print("🚙 Просмотр всего ангара")
+        print("👑 Админ панель (/admin)")
         print("🛑 Остановка: Ctrl+C")
         print("=" * 60)
         print("\nБот запущен...\n")
@@ -627,6 +818,7 @@ class BlitzBotUltimate:
                         
                         if 'message' in update:
                             self.process_message(update['message'])
+
                         elif 'callback_query' in update:
                             self.handle_callback(update['callback_query'])
                 
